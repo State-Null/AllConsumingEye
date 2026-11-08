@@ -217,28 +217,21 @@ local IS_WARDROBE_AMMO = {
 }
 
 -- -----------------------------------------------------------------------------
--- Player Identity Cache, Live Packet Slot Overlay (0x01E/0x01F/0x020), & Pre-Use State
---   In Windower 4, `windower.ffxi.get_items(bag_id)` reads the client's committed item
---   buffer, which only updates from the staging buffer once `0x01D` (Finish Inventory)
---   flushes the bag. When `itemizer` moves 1 item from Satchel/Case/Sack into Inventory
---   and immediately uses it (or right after zoning), `get_items(5)` can still report the
---   stale pre-move Satchel count while `get_items(0)` reports `1 -> 0`.
---   Tracking `0x01E` (Modify Inventory), `0x01F` (Item Assign), and `0x020` (Item Updates)
---   in `live_slot_cache` ensures instant, authoritative slot counts across all bags.
+-- Player Identity Cache, Pre-Use Snapshot, & Rapid-Use Guard (Zero Extra Packet Hooks)
+--   1. `pending_pre_total` snapshots the count on 0x028 Category 9 (Item Use Begin).
+--   2. `last_stock_total` + `last_stock_at` (30s rapid-use window) guards against
+--      `itemizer` split-transfer inflation (where Inventory briefly gets +1 before
+--      Satchel/Case/Sack flushes -1) when spamming Holy Waters or Silent Oils back-to-back,
+--      with zero 0x01E/0x01F/0x020 packet hooks.
 -- -----------------------------------------------------------------------------
-local TRACKED_BAG_SET = {}
-for b = 1, NUM_ALL_BAGS do
-    TRACKED_BAG_SET[ALL_BAGS[b].id] = true
-end
-
+local RAPID_USE_WINDOW  = 30.0
 local player_id         = nil
 local player_name       = nil
 local pending_item_id   = nil
 local pending_pre_total = nil
 local pending_at        = 0
-local live_slot_cache   = {}
 local last_stock_total  = {}
-local last_01e_clock    = 0
+local last_stock_at     = {}
 
 local function get_player_identity()
     if not player_id or not player_name then
@@ -256,8 +249,8 @@ windower.register_event('login', 'logout', function()
     player_name       = nil
     pending_item_id   = nil
     pending_pre_total = nil
-    live_slot_cache   = {}
     last_stock_total  = {}
+    last_stock_at     = {}
 end)
 
 windower.register_event('zone change', function()
@@ -265,15 +258,14 @@ windower.register_event('zone change', function()
     player_name       = nil
     pending_item_id   = nil
     pending_pre_total = nil
-    live_slot_cache   = {}
 end)
 
 -- -----------------------------------------------------------------------------
 -- Two-Tier Single-Pass Multi-Bag Item + Reserve Container Counters
 -- 1. `count_item_across_bags`: Fast 4-bag scan (Inv, Satchel, Case, Sack)
 -- 2. `count_item_with_wardrobes`: Isolated 12-bag scan (+ Wardrobe 1..8) for Angon/Tomahawk
--- Merges `get_items(bag_id)` with `live_slot_cache[bag_id]`, counts both the target item
--- AND any matching Toolbag/Pouch/Case in ONE pass, and skips empty/disabled bags.
+-- Counts both the target item AND any matching Toolbag/Pouch/Case in ONE pass,
+-- and skips empty (`count == 0`) or unsubscribed (`enabled == false`) bags.
 -- -----------------------------------------------------------------------------
 local function is_usable_consumable(item_id)
     local item_res = res.items[item_id]
@@ -288,38 +280,26 @@ local function count_item_in_tier(target_id, max_bag_idx)
     local cont_id     = cont and cont.id or nil
 
     for b = 1, max_bag_idx do
-        local bag_id    = ALL_BAGS[b].id
-        local bag_info  = get_bag_info(bag_id)
-        local bag_cache = live_slot_cache[bag_id]
-        local bag_sum   = 0
+        local bag_id   = ALL_BAGS[b].id
+        local bag_info = get_bag_info(bag_id)
+        local bag_sum  = 0
         -- Skip unsubscribed Wardrobes (`enabled == false`) and empty bags (`count == 0`)
-        -- unless `live_slot_cache` has pending slot updates for that bag.
-        if bag_cache or not bag_info or (bag_info.enabled ~= false and (not bag_info.count or bag_info.count > 0)) then
+        if not bag_info or (bag_info.enabled ~= false and (not bag_info.count or bag_info.count > 0)) then
             local bag_data = get_items(bag_id)
-            if bag_data or bag_cache then
-                local max_slots  = (bag_data and bag_data.max) or 80
+            if bag_data then
+                local max_slots  = bag_data.max or 80
                 local scan_pouch = (cont_id ~= nil and b <= NUM_STD_BAGS)
                 for slot = 1, max_slots do
-                    local entry = bag_data and bag_data[slot]
-                    local ovr   = bag_cache and bag_cache[slot]
-                    local eid, cnt
-                    if ovr then
-                        cnt = ovr.count
+                    local entry = bag_data[slot]
+                    if entry then
+                        local cnt = entry.count
                         if cnt and cnt > 0 then
-                            eid = ovr.id or (entry and entry.id)
-                            if not ovr.id and eid and eid > 0 then
-                                ovr.id = eid
+                            local eid = entry.id
+                            if eid == target_id then
+                                bag_sum = bag_sum + cnt
+                            elseif scan_pouch and eid == cont_id then
+                                pouch_total = pouch_total + cnt
                             end
-                        end
-                    elseif entry then
-                        eid = entry.id
-                        cnt = entry.count
-                    end
-                    if cnt and cnt > 0 and eid then
-                        if eid == target_id then
-                            bag_sum = bag_sum + cnt
-                        elseif scan_pouch and eid == cont_id then
-                            pouch_total = pouch_total + cnt
                         end
                     end
                 end
@@ -444,13 +424,17 @@ end
 local function announce_item_stock(item_id, pre_total, attempt, unpacked_id)
     attempt = attempt or 1
     local total, by_bag, pouch_cnt = count_item_across_bags(item_id)
+    local now = os_clock()
 
-    -- Guard against `itemizer` split-transfer inflation (where Inventory temporarily has +1
-    -- before Satchel/Case/Sack flushes -1) AND 0x028 arriving before 0x01E/0x020/0x01D.
+    -- Guard against `itemizer` split-transfer inflation (where Inventory briefly has +1
+    -- before Satchel/Case/Sack flushes -1) AND 0x028 arriving before 0x020/0x01D.
     local expected_max = pre_total
     local prev_total   = last_stock_total[item_id]
-    if prev_total and (not expected_max or prev_total < expected_max) and total <= prev_total + 1 then
-        expected_max = prev_total
+    local prev_at      = last_stock_at[item_id]
+    if prev_total and prev_at and (now - prev_at) <= RAPID_USE_WINDOW then
+        if (not expected_max or prev_total < expected_max) and total <= prev_total + 1 then
+            expected_max = prev_total
+        end
     end
 
     if expected_max and total >= expected_max and total > 0 then
@@ -460,7 +444,7 @@ local function announce_item_stock(item_id, pre_total, attempt, unpacked_id)
             end, 0.18)
             return
         else
-            -- Deterministic fallback if server 0x01E/0x020 or 0x01D flush is still in flight
+            -- Deterministic fallback if server 0x020/0x01D flush is still in flight
             local new_total = math_max(0, expected_max - 1)
             local drop      = total - new_total
             total           = new_total
@@ -475,6 +459,7 @@ local function announce_item_stock(item_id, pre_total, attempt, unpacked_id)
     end
 
     last_stock_total[item_id] = total
+    last_stock_at[item_id]    = now
 
     if is_usable_consumable(item_id) then
         report_and_ipc(item_id, total, by_bag, nil, pouch_cnt)
@@ -485,96 +470,19 @@ local function announce_item_stock(item_id, pre_total, attempt, unpacked_id)
     if unpacked_id and unpacked_id > 0 and unpacked_id ~= item_id and res.items[unpacked_id] then
         local u_total, u_bags, u_pouch = count_item_across_bags(unpacked_id)
         last_stock_total[unpacked_id]  = u_total
+        last_stock_at[unpacked_id]     = now
         report_and_ipc(unpacked_id, u_total, u_bags, 'Unpacked ->', u_pouch)
     end
 end
 
 -- -----------------------------------------------------------------------------
--- Ultra-Fast Raw Packet Inspection:
---   - 0x01E (Modify Inventory), 0x01F (Item Assign), 0x020 (Item Updates):
---     Updates `live_slot_cache` in ~15ns via raw `string.byte` without waiting for `0x01D`
---     to copy the FFXI client's staging item buffer into `windower.ffxi.get_items()`.
---   - 0x028 (Action Packet):
---     Pre-filters BOTH `actor_id` (bytes 6..9) AND 4-bit `Category` (byte 11, bits 2..5)
---     BEFORE calling `windower.packets.parse_action(data)`.
+-- Ultra-Fast Raw 0x028 Action Packet Inspection
+--   Pre-filters BOTH `actor_id` (bytes 6..9) AND 4-bit `Category` (byte 11, bits 2..5)
+--   in a single `string.byte(data, 6, 11)` C-call BEFORE calling `windower.packets.parse_action(data)`.
+--   Non-player actions AND player melee/ranged/WS/buffs return in ~3 nanoseconds with ZERO table allocation.
 -- -----------------------------------------------------------------------------
 windower.register_event('incoming chunk', function(id, data, modified, injected, blocked)
-    if injected then return end
-
-    -- 0x01E: Modify Inventory (Count @ 5..8, Bag @ 9, Slot @ 10)
-    if id == 0x01E then
-        if #data < 10 then return end
-        local b5, b6, b7, b8, bag_id, slot = s_byte(data, 5, 10)
-        if TRACKED_BAG_SET[bag_id] and slot >= 1 and slot <= 80 then
-            local count = b5 + b6 * 256 + b7 * 65536 + b8 * 16777216
-            if bag_id == 5 or bag_id == 6 or bag_id == 7 then
-                last_01e_clock = os_clock()
-            end
-            local bag_cache = live_slot_cache[bag_id]
-            if not bag_cache then
-                bag_cache = {}
-                live_slot_cache[bag_id] = bag_cache
-            end
-            local prev = bag_cache[slot]
-            if count == 0 then
-                bag_cache[slot] = { id = 0, count = 0 }
-            elseif prev then
-                prev.count = count
-            else
-                bag_cache[slot] = { id = nil, count = count }
-            end
-        end
-        return
-    end
-
-    -- 0x01F: Item Assign (Count @ 5..8, Item @ 9..10, Bag @ 11, Slot @ 12)
-    if id == 0x01F then
-        if #data < 12 then return end
-        local b5, b6, b7, b8, b9, b10, bag_id, slot = s_byte(data, 5, 12)
-        if TRACKED_BAG_SET[bag_id] and slot >= 1 and slot <= 80 then
-            local count   = b5 + b6 * 256 + b7 * 65536 + b8 * 16777216
-            local item_id = b9 + b10 * 256
-            local bag_cache = live_slot_cache[bag_id]
-            if not bag_cache then
-                bag_cache = {}
-                live_slot_cache[bag_id] = bag_cache
-            end
-            if count == 0 or item_id == 0 then
-                bag_cache[slot] = { id = 0, count = 0 }
-            else
-                bag_cache[slot] = { id = item_id, count = count }
-                -- Clear monotonic guard if a stack > 1 was added or if +1 was obtained outside an itemizer transfer
-                if count > 1 or (bag_id == 0 and (os_clock() - last_01e_clock) > 1.0) then
-                    last_stock_total[item_id] = nil
-                end
-            end
-        end
-        return
-    end
-
-    -- 0x020: Item Updates (Count @ 5..8, Item @ 13..14, Bag @ 15, Slot @ 16)
-    if id == 0x020 then
-        if #data < 16 then return end
-        local b5, b6, b7, b8     = s_byte(data, 5, 8)
-        local b13, b14, bag_id, slot = s_byte(data, 13, 16)
-        if TRACKED_BAG_SET[bag_id] and slot >= 1 and slot <= 80 then
-            local count   = b5 + b6 * 256 + b7 * 65536 + b8 * 16777216
-            local item_id = b13 + b14 * 256
-            local bag_cache = live_slot_cache[bag_id]
-            if not bag_cache then
-                bag_cache = {}
-                live_slot_cache[bag_id] = bag_cache
-            end
-            if count == 0 or item_id == 0 then
-                bag_cache[slot] = { id = 0, count = 0 }
-            else
-                bag_cache[slot] = { id = item_id, count = count }
-            end
-        end
-        return
-    end
-
-    if id ~= 0x028 or #data < 12 then return end
+    if id ~= 0x028 or injected or #data < 12 then return end
 
     local my_id = get_player_identity()
     if not my_id then return end
@@ -607,15 +515,17 @@ windower.register_event('incoming chunk', function(id, data, modified, injected,
             local item_id = a1 and a1.param
             if item_id and item_id > 0 and is_usable_consumable(item_id) then
                 local raw_pre, pre_bags = count_item_across_bags(item_id)
+                local now               = os_clock()
                 local prev_tot          = last_stock_total[item_id]
+                local prev_at           = last_stock_at[item_id]
                 -- If `itemizer` just pulled +1 into Inventory while the source bag hasn't flushed -1 yet,
                 -- clamp `pending_pre_total` to `prev_tot` so `raw_pre` isn't inflated by +1.
-                if prev_tot and raw_pre == prev_tot + 1 and (pre_bags[1] or 0) >= 1 then
+                if prev_tot and prev_at and (now - prev_at) <= RAPID_USE_WINDOW and raw_pre <= prev_tot + 1 and (pre_bags[1] or 0) >= 1 and raw_pre > prev_tot then
                     raw_pre = prev_tot
                 end
                 pending_item_id   = item_id
                 pending_pre_total = raw_pre
-                pending_at        = os_clock()
+                pending_at        = now
             end
         elseif act.param == 28787 then
             pending_item_id   = nil
@@ -747,28 +657,15 @@ local function scan_all_consumables(filter_query, only_low)
         local is_wardrobe = (b > NUM_STD_BAGS)
         local bag_id      = ALL_BAGS[b].id
         local bag_info    = get_bag_info(bag_id)
-        local bag_cache   = live_slot_cache[bag_id]
-        if bag_cache or not bag_info or (bag_info.enabled ~= false and (not bag_info.count or bag_info.count > 0)) then
+        if not bag_info or (bag_info.enabled ~= false and (not bag_info.count or bag_info.count > 0)) then
             local bag_data = get_items(bag_id)
-            if bag_data or bag_cache then
-                local max_slots = (bag_data and bag_data.max) or 80
+            if bag_data then
+                local max_slots = bag_data.max or 80
                 for slot = 1, max_slots do
-                    local entry = bag_data and bag_data[slot]
-                    local ovr   = bag_cache and bag_cache[slot]
-                    local iid, cnt
-                    if ovr then
-                        cnt = ovr.count
-                        if cnt and cnt > 0 then
-                            iid = ovr.id or (entry and entry.id)
-                            if not ovr.id and iid and iid > 0 then
-                                ovr.id = iid
-                            end
-                        end
-                    elseif entry then
-                        iid = entry.id
-                        cnt = entry.count
-                    end
-                    if iid and iid > 0 and cnt and cnt > 0 then
+                    local entry = bag_data[slot]
+                    if entry and entry.id and entry.id > 0 and entry.count and entry.count > 0 then
+                        local iid = entry.id
+                        local cnt = entry.count
                         if not is_wardrobe then
                             raw_counts[iid] = (raw_counts[iid] or 0) + cnt
                         end
