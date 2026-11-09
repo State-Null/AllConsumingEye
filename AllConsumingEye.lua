@@ -152,19 +152,38 @@ local ITEM_TO_CONTAINER = {
     [2973] = { id = 5869, label = 'Toolbag' }, -- Chonofuda -> Toolbag (Cho)
     -- Corsair Cards -> Card Cases
     [2974] = { id = 5870, label = 'Case'    }, -- Trump Card -> Trump Card Case
-    [2176] = { id = 5408, label = 'Case'    }, -- Fire Card -> Fire Card Case
-    [2177] = { id = 5409, label = 'Case'    }, -- Ice Card -> Ice Card Case
-    [2178] = { id = 5410, label = 'Case'    }, -- Wind Card -> Wind Card Case
-    [2179] = { id = 5411, label = 'Case'    }, -- Earth Card -> Earth Card Case
-    [2180] = { id = 5412, label = 'Case'    }, -- Thunder Card -> Thunder Card Case
-    [2181] = { id = 5413, label = 'Case'    }, -- Water Card -> Water Card Case
-    [2182] = { id = 5414, label = 'Case'    }, -- Light Card -> Light Card Case
-    [2183] = { id = 5415, label = 'Case'    }, -- Dark Card -> Dark Card Case
+    [2176] = { id = 5402, label = 'Case'    }, -- Fire Card -> Fire Card Case
+    [2177] = { id = 5403, label = 'Case'    }, -- Ice Card -> Ice Card Case
+    [2178] = { id = 5404, label = 'Case'    }, -- Wind Card -> Wind Card Case
+    [2179] = { id = 5405, label = 'Case'    }, -- Earth Card -> Earth Card Case
+    [2180] = { id = 5406, label = 'Case'    }, -- Thunder Card -> Thunder Card Case
+    [2181] = { id = 5407, label = 'Case'    }, -- Water Card -> Water Card Case
+    [2182] = { id = 5408, label = 'Case'    }, -- Light Card -> Light Card Case
+    [2183] = { id = 5409, label = 'Case'    }, -- Dark Card -> Dark Card Case
     -- REMA Bullets -> Waist Pouches
     [21324] = { id = 26350, label = 'Pouch'  }, -- Chrono Bullet -> Chr. Bul. Pouch
     [21323] = { id = 26348, label = 'Pouch'  }, -- Living Bullet -> Liv. Bul. Pouch
     [21322] = { id = 26349, label = 'Pouch'  }, -- Devastating Bullet -> Dev. Bul. Pouch
     [21321] = { id = 26347, label = 'Pouch'  }, -- Eradicating Bullet -> Era. Bul. Pouch
+}
+
+-- O(1) Reverse Lookup: Container Item ID (Toolbag / Card Case / Bullet Pouch) -> Unpacked Item ID
+local CONTAINER_TO_ITEM = {}
+for item_id, cont in pairs(ITEM_TO_CONTAINER) do
+    CONTAINER_TO_ITEM[cont.id] = item_id
+end
+
+-- O(1) Non-Consumable Category 5 Action Messages (Spell/Ability Scrolls, Gil/Silt/Bead Pouches, Ciphers/Mounts)
+local NON_CONSUMABLE_ACTION_MSGS = {
+    [23]  = true, -- learns a new spell
+    [45]  = true, -- learns weapon skill
+    [419] = true, -- learns spell
+    [442] = true, -- learns a new ability (Corsair Die)
+    [565] = true, -- obtains gil
+    [582] = true, -- obtains gil
+    [758] = true, -- Obtained key item (Trust Cipher, Mount, Orchestrion)
+    [765] = true, -- obtains escha silt (Silt Pouch)
+    [766] = true, -- obtains escha beads (Bead Pouch)
 }
 
 -- Ninjutsu Spell ID -> { specific_tool_id, universal_tool_id }
@@ -267,9 +286,89 @@ end)
 -- Counts both the target item AND any matching Toolbag/Pouch/Case in ONE pass,
 -- and skips empty (`count == 0`) or unsubscribed (`enabled == false`) bags.
 -- -----------------------------------------------------------------------------
+-- -----------------------------------------------------------------------------
+-- O(1) Memoized Consumable Classifier (`is_usable_consumable`)
+--   Filters out non-consumable `category == 'Usable'` items (Sortie `Old Case`,
+--   `??? Earring`, NM Coffers, Pluton/Boulder Boxes, Synthesis Crystals/Clusters,
+--   Spell Scrolls, Trust Ciphers, Raw Fish, Skill-up Books, Chairs/Mounts) while
+--   preserving tracked Toolbags, Card Cases, and REMA Bullet Pouches.
+-- -----------------------------------------------------------------------------
+local NON_CONSUMABLE_PATTERNS = {
+    'coffer', 'old case', 'pluton case', 'boulder case', 'beitetsu parcel',
+    'box', 'purse', 'frayed sack', 'worn sack', 'frayed pouch', 'sack of ',
+    'grab bag', 'knapsack', 'silt pouch', 'bead pouch', 'stone pouch',
+    'metal pouch', 'bolt case', 'enchiridion', 'book of deeds',
+    'trust primer', 'trust tome', 'chair', 'throne', 'bench', 'stool',
+    'yggrete shard', 'yggzi bead',
+}
+
+local usable_cache = {}
+
 local function is_usable_consumable(item_id)
+    local cached = usable_cache[item_id]
+    if cached ~= nil then
+        return cached
+    end
+
+    if ITEM_TO_CONTAINER[item_id] or CONTAINER_TO_ITEM[item_id] then
+        usable_cache[item_id] = true
+        return true
+    end
+
     local item_res = res.items[item_id]
-    return item_res ~= nil and (item_res.category == 'Usable' or ITEM_TO_CONTAINER[item_id] ~= nil)
+    if not item_res or item_res.category ~= 'Usable' then
+        usable_cache[item_id] = false
+        return false
+    end
+
+    -- Exclude Synthesis Crystals (type 8), Raw Fish (type 3), Ballista Books (type 15), Event Pouches (type 2)
+    local t = item_res.type
+    if t ~= 7 and t ~= 1 then
+        usable_cache[item_id] = false
+        return false
+    end
+
+    -- Exclude Elemental Clusters (4104..4111) and Geomancy learning plates (6073..6132)
+    if (item_id >= 4104 and item_id <= 4111) or (item_id >= 6073 and item_id <= 6132) then
+        usable_cache[item_id] = false
+        return false
+    end
+
+    local en  = s_lower(item_res.en or '')
+    local enl = s_lower(item_res.enl or en)
+
+    -- Exclude appraisal/unidentified items (??? Ear.: PUP +1, ??? Box), Trust Ciphers, Decanters, Mounts
+    if s_sub(en, 1, 3) == '???' or s_sub(enl, 1, 3) == '???'
+        or s_sub(en, 1, 7) == 'cipher:' or s_sub(enl, 1, 7) == 'cipher:'
+        or s_sub(en, 1, 5) == 'dec.:' or s_sub(enl, 1, 9) == 'decanter:'
+        or s_sub(en, 1, 3) == '\226\153\170' then
+        usable_cache[item_id] = false
+        return false
+    end
+
+    -- Exclude Spell Scrolls (keep Instant Warp/Retrace/Reraise/Protect/Shell/Stoneskin & Dusty Reraise)
+    if s_sub(enl, 1, 10) == 'scroll of ' and not s_find(enl, 'instant ', 1, true) then
+        usable_cache[item_id] = false
+        return false
+    end
+
+    -- Exclude Scholar Schemas, Corsair Dice, Skillup Books/Pages, and Sheet Music
+    if s_sub(enl, -7) == ' schema' or s_sub(enl, -4) == ' die'
+        or s_sub(enl, 1, 8) == 'copy of ' or s_sub(enl, 1, 8) == 'page of ' or s_sub(enl, 1, 9) == 'sheet of ' then
+        usable_cache[item_id] = false
+        return false
+    end
+
+    -- Exclude Loot Boxes, Coffers, Old Cases, Purses, Frayed/Worn Sacks, and Furniture
+    for i = 1, #NON_CONSUMABLE_PATTERNS do
+        if s_find(enl, NON_CONSUMABLE_PATTERNS[i], 1, true) then
+            usable_cache[item_id] = false
+            return false
+        end
+    end
+
+    usable_cache[item_id] = true
+    return true
 end
 
 local function count_item_in_tier(target_id, max_bag_idx)
@@ -544,16 +643,28 @@ windower.register_event('incoming chunk', function(id, data, modified, injected,
         local action_param = a1 and a1.param
         local action_msg   = a1 and a1.message
 
-        -- Detect if using this item unpacked another item (e.g. Toolbag, Bullet Pouch, Card Case)
-        local unpacked_id = nil
-        if action_param and action_param > 0 and action_param ~= item_id then
-            local u_res = res.items[action_param]
-            if u_res and (action_msg == 584 or ITEM_TO_CONTAINER[action_param] ~= nil or (u_res.stack and u_res.stack > 1)) then
+        -- Ignore Spell/Ability Scrolls, Gil/Silt/Bead Pouches, Trust Ciphers, and Mounts
+        if action_msg and NON_CONSUMABLE_ACTION_MSGS[action_msg] then
+            pending_item_id   = nil
+            pending_pre_total = nil
+            return
+        end
+
+        -- When an item yields another item (msg 376/377/584), ONLY report if it is a tracked
+        -- Toolbag, Card Case, or REMA Bullet Pouch (`CONTAINER_TO_ITEM[item_id]`).
+        -- Ignore loot boxes, Sortie `Old Case +1`, `??? Earring`, NM Coffers, Pluton Boxes, etc.
+        local unpacked_id = CONTAINER_TO_ITEM[item_id]
+        if not unpacked_id and (action_msg == 376 or action_msg == 377 or action_msg == 584) then
+            if action_param and ITEM_TO_CONTAINER[action_param] then
                 unpacked_id = action_param
+            else
+                pending_item_id   = nil
+                pending_pre_total = nil
+                return
             end
         end
 
-        -- Skip enchantment gear (e.g. Warp Ring / Echad Ring) that neither consumes a stack nor unpacks an item
+        -- Skip enchantment gear (e.g. Warp Ring / Echad Ring) and non-consumable usable items
         if not unpacked_id and not is_usable_consumable(item_id) then
             pending_item_id   = nil
             pending_pre_total = nil
@@ -679,10 +790,9 @@ local function scan_all_consumables(filter_query, only_low)
                             elseif not rejected[iid] then
                                 local item_res = res.items[iid]
                                 if item_res then
-                                    local is_consumable = (item_res.category == 'Usable')
+                                    local is_consumable = is_usable_consumable(iid)
                                         or EXTRA_TRACKED_IDS[iid]
                                         or (settings.track_ja_ammo and IS_WARDROBE_AMMO[iid])
-                                        or (ITEM_TO_CONTAINER[iid] ~= nil)
                                     local matches_query = true
                                     if q then
                                         local name_l = s_lower(item_res.en or '')
